@@ -9,27 +9,33 @@ using Microsoft.Extensions.Configuration;
 using Serilog;
 using System.Diagnostics;
 using Serilog.Debugging;
+using System.Threading;
 
 namespace CTU60G
 {
     public class Program
     {
-        public static void Main(string[] args)
+        
+        public static async Task Main(string[] args)
         {
-            
+            IHost host = default;
+            CancellationTokenSource cancelationSource = new CancellationTokenSource();
+
             Serilog.Debugging.SelfLog.Enable(msg => Debug.WriteLine(msg));
             Serilog.Debugging.SelfLog.Enable(Console.Error);
             if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows)) CreateWindowsHostBuilder(args).Build().Run();
                 else if(RuntimeInformation.IsOSPlatform(OSPlatform.Linux)) CreateLinuxHostBuilder(args).Build().Run();
                     else throw new SystemException("Unsupported system.");
+
         }
 
         public static IHostBuilder CreateWindowsHostBuilder(string[] args) =>
             Host.CreateDefaultBuilder(args)
+                .UseConsoleLifetime(opts => opts.SuppressStatusMessages = true)
                 .UseWindowsService()
+                .UseConsoleLifetime()
                 .ConfigureServices((hostContext, services) =>
                 {
-                    services.AddTransient<Program>();
                     IConfiguration configuration = hostContext.Configuration;
                     WorkerOptions options = configuration.GetSection("Config").Get<WorkerOptions>();
                     services.AddSingleton(options);

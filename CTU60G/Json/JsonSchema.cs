@@ -9,18 +9,24 @@
 
     public partial class WirelessSite
     {
-        [JsonProperty("infos", Required = Required.Always, NullValueHandling = NullValueHandling.Ignore)]
+        [JsonProperty("infos", Required = Required.Always)]
         public WirelessSiteInfo Infos { get; set; }
+
+        [JsonProperty("site_type", NullValueHandling = NullValueHandling.Ignore)]
+        public string SiteType { get; set; }
 
         [JsonProperty("stations", NullValueHandling = NullValueHandling.Ignore)]
         public List<WirelessUnit> Stations { get; set; }
 
-        [JsonProperty("ap", NullValueHandling = NullValueHandling.Ignore)]
+        [JsonProperty("ap", Required = Required.Always)]
         public List<WirelessUnit> Ap { get; set; }
     }
 
     public partial class WirelessUnit
     {
+        [JsonProperty("name", NullValueHandling = NullValueHandling.Ignore)]
+        public string Name { get; set; }
+
         [JsonProperty("lat", NullValueHandling = NullValueHandling.Ignore)]
         public string Lat { get; set; }
 
@@ -30,8 +36,29 @@
         [JsonProperty("freq", NullValueHandling = NullValueHandling.Ignore)]
         public string Freq { get; set; }
 
+        [JsonProperty("antena_gain", NullValueHandling = NullValueHandling.Ignore)]
+        public string AntennaGain { get; set; }
+
+        [JsonProperty("power", NullValueHandling = NullValueHandling.Ignore)]
+        public string Power { get; set; }
+
+        [JsonProperty("channel_width", NullValueHandling = NullValueHandling.Ignore)]
+        public string ChannelWidth { get; set; }
+
+        [JsonProperty("rsn", NullValueHandling = NullValueHandling.Ignore)]
+        public string RSN { get; set; }
+
+        [JsonProperty("azimut", NullValueHandling = NullValueHandling.Ignore)]
+        public string Azimut { get; set; }
+
+        [JsonProperty("eirp", NullValueHandling = NullValueHandling.Ignore)]
+        public string EIRP { get; set; }
+
         [JsonProperty("mac_addr", NullValueHandling = NullValueHandling.Ignore)]
         public string MacAddr { get; set; }
+
+        [JsonProperty("sn", NullValueHandling = NullValueHandling.Ignore)]
+        public string SerialNumber { get; set; }
 
         [JsonProperty("mode", NullValueHandling = NullValueHandling.Ignore)]
         public string Mode { get; set; }
@@ -50,5 +77,6 @@
 
         [JsonProperty("subnet_id", NullValueHandling = NullValueHandling.Ignore)]
         public string SubnetId { get; set; }
+
     }
 }

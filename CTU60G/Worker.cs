@@ -11,28 +11,133 @@ using Newtonsoft.Json.Linq;
 using CTU60GLib.Client;
 using Client.Json;
 using CTU60GLib;
+using CTU60GLib.Exceptions;
+using System.IO;
 
 namespace CTU60G
 {
-    public class Worker : BackgroundService
+    public class Worker : BackgroundService, IDisposable
     {
         private readonly ILogger<Worker> _logger;
         private readonly WorkerOptions _workerOptions;
+        private readonly IHostApplicationLifetime _applifetime;
 
-        public Worker(ILogger<Worker> logger, WorkerOptions workerOptions)
+        public Worker(ILogger<Worker> logger, IHostApplicationLifetime appLifetime, WorkerOptions workerOptions)
         {
             _logger = logger;
             _workerOptions = workerOptions;
+            _applifetime = appLifetime;
+
+            _applifetime.ApplicationStarted.Register(OnStarted);
+            _applifetime.ApplicationStopping.Register(OnStopping);
+            _applifetime.ApplicationStopped.Register(OnStopped);
+        }
+
+        private enum SourceDataType
+        {
+            URL,
+            FILE,
+            ERR
+        }
+
+        private SourceDataType GetSourceDataType()
+        {
+            Uri uriResult;
+            Uri.TryCreate(_workerOptions.DataURLOrFilePath, UriKind.Absolute, out uriResult);
+            if (uriResult == null) return SourceDataType.ERR;
+            else if (uriResult.Scheme == Uri.UriSchemeHttp || uriResult.Scheme == Uri.UriSchemeHttps) return SourceDataType.URL;
+            if (uriResult.IsFile && File.Exists(uriResult.AbsolutePath)) return SourceDataType.FILE;
+
+            return SourceDataType.ERR;
+            
         }
 
         protected override async Task ExecuteAsync(CancellationToken stoppingToken)
         {
+            
             while (!stoppingToken.IsCancellationRequested)
             {
-                _logger.LogWarning("test");
-                CTUClient client = new CTUClient();
-                await client.LoginAsync(_workerOptions.CTULogin, _workerOptions.CTUPass);
+                SourceDataType sourceDataType;
+                if (_workerOptions.CTULogin == string.Empty || _workerOptions.CTUPass == string.Empty)
+                {
+                    _logger.LogError("Missing credentials for www.60ghz.ctu.cz");
+                    await StopAsync(stoppingToken);
+                    return;
+                }
+                else if(_workerOptions.DataURLOrFilePath == string.Empty)
+                {
+                    _logger.LogError("Missing data source for www.60ghz,ctu.cz");
+                    await StopAsync(stoppingToken);
+                    return;
+                }
+                else if( (sourceDataType = GetSourceDataType()) == SourceDataType.ERR)
+                {
+                    _logger.LogError("Not valid file path or web url");
+                    await StopAsync(stoppingToken);
+                    return;
+                }
 
+                _logger.LogInformation("Loading data");
+                string data = (sourceDataType == SourceDataType.FILE)?
+                    File.ReadAllText(_workerOptions.DataURLOrFilePath) :
+                    new WebClient().DownloadString(_workerOptions.DataURLOrFilePath);
+
+                _logger.LogInformation("DeserializingData");
+                List<WirelessSite> sites = new List<WirelessSite>();
+                try
+                {
+                    var jObj = JObject.Parse(data).Children().Children();
+                    foreach (var site in jObj)
+                    {
+                        try
+                        {
+                            sites.Add(site.ToObject<WirelessSite>());
+                        }
+                        catch (Exception)
+                        {
+                            _logger.LogWarning($"Cannot deserialize part, skiping:\n{site.ToString()}");
+                        }
+                        
+                    }
+
+                }
+                catch (Exception e)
+                {
+                    _logger.LogError("Source data are not seriazible");
+                    await StopAsync(stoppingToken);
+                    return;
+                }
+
+
+                
+                CTUClient client = new CTUClient();
+                _logger.LogInformation("LoggingIn");
+                try
+                {
+                    await client.LoginAsync(_workerOptions.CTULogin, _workerOptions.CTUPass);
+                }
+                catch (InvalidMailOrPasswordException )
+                {
+                    _logger.LogError("Invalid login credentials");
+                    _logger.LogWarning("Shuting service down");
+                    return;
+                }
+                catch (WebServerException )
+                {
+                    _logger.LogError("Web server exception occured during login");
+                    _logger.LogWarning("Shuting service down");
+                    return;
+                }
+                catch (Exception e)
+                {
+
+                    _logger.LogError("unknown exception occured during login");
+                    _logger.LogWarning("Shuting service down");
+                    return;
+                }
+
+
+#if DEBUG
                 List<Client.Json.CtuWirelessUnit> qq = await client.GetMyStationsAsync();
                 List<string> alreadyRemoved = new List<string>();
                 foreach (var item in qq)
@@ -48,7 +153,9 @@ namespace CTU60G
 
                     }
                 }
+#endif
 
+                #region
                 FixedP2PPair conn;
                 WigigPTMPUnitInfo wigig;
                 try
@@ -96,17 +203,55 @@ namespace CTU60G
 
                     throw;
                 }
-               
+                //RegistrationJournal rj = await client.AddPTPConnectionAsync(conn);
+                //RegistrationJournal rj2 = await client.AddWIGIG_PTP_PTMPConnectionAsync(wigig);
+
+                #endregion
+                foreach (var site in sites)
+                {
+                    if(site.Ap != null && site.Stations.Count == 1)
+                    {
+                        //p2p
+                    }
+                    //else if()
+
+                }
 
 
-                RegistrationJournal rj = await client.AddPTPConnectionAsync(conn);
-                RegistrationJournal rj2 = await client.AddWIGIG_PTP_PTMPConnectionAsync(wigig);
-                _logger.LogError("Ahoj");
                 
                 
                 await Task.Delay(1);
                 break;
             }
         }
+
+        public override async Task StopAsync(CancellationToken stoppingToken)
+        {
+            stoppingToken.ThrowIfCancellationRequested();
+            await Task.CompletedTask;
+        }
+
+        private void OnStarted()
+        {
+            
+            _logger.LogInformation("OnStarted has been called.");
+
+            // Perform post-startup activities here
+        }
+
+        private void OnStopping()
+        {
+            _logger.LogInformation("OnStopping has been called.");
+
+            // Perform on-stopping activities here
+        }
+
+        private void OnStopped()
+        {
+            _logger.LogInformation("OnStopped has been called.");
+
+            // Perform post-stopped activities here
+        }
+
     }
 }
