@@ -99,26 +99,34 @@ namespace CTU60G
                 msg.To.Add(item);
             }
 
-            SmtpClient client = new SmtpClient();
-            client.Host = config.Host;
-            client.Port = config.Port;
-            if (config.EnableSsl == "true")
+            using(SmtpClient client = new SmtpClient(config.Host,config.Port))
             {
-                client.EnableSsl = true;
+                client.UseDefaultCredentials = false;
+                client.Credentials = new System.Net.NetworkCredential(config.User, config.Password);
+                client.DeliveryMethod = SmtpDeliveryMethod.Network;
+                client.EnableSsl = (bool.Parse(config.EnableSsl));
+                try
+                {
+                    client.Send(msg);
+                }
+                catch (Exception e)
+                {
+
+                    throw;
+                }
+
+
+
             }
-            else
-            {
-                client.EnableSsl = false;
-            }
-            client.DeliveryMethod = SmtpDeliveryMethod.Network;
-            client.UseDefaultCredentials = false;
-            client.Credentials = new System.Net.NetworkCredential(config.User, config.Password);
-            client.Send(msg);
+            
+            
+           
         }
 
         public void Send(String subject, String body)
         {
             MailMessage msg = createMsg(subject, body);
+            msg.IsBodyHtml = isHTML;
             sendEmail(msg);
         }
 

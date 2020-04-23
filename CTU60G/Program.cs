@@ -37,8 +37,10 @@ namespace CTU60G
                 .ConfigureServices((hostContext, services) =>
                 {
                     IConfiguration configuration = hostContext.Configuration;
-                    WorkerOptions options = configuration.GetSection("Config").Get<WorkerOptions>();
-                    services.AddSingleton(options);
+                    WorkerOptions wOptions = configuration.GetSection("Config").Get<WorkerOptions>();
+                    services.AddSingleton(wOptions);
+                    EmailOptions eOptions = configuration.GetSection("Email").Get<EmailOptions>();
+                    services.AddSingleton(eOptions);
                     services.AddHostedService<Worker>();
 
                 }).ConfigureAppConfiguration((hostContext, configApp) =>
@@ -55,7 +57,7 @@ namespace CTU60G
                                 .ReadFrom.Configuration(hostingContext.Configuration)
                                 .Enrich.FromLogContext()
                                 .Enrich.WithProperty("ApplicationName", typeof(Program).Assembly.GetName().Name)
-                                .Enrich.WithProperty("Environment", hostingContext.HostingEnvironment);                                ;
+                                .Enrich.WithProperty("Environment", hostingContext.HostingEnvironment);
                 });
 
         

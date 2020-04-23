@@ -13,6 +13,13 @@ using Client.Json;
 using CTU60GLib;
 using CTU60GLib.Exceptions;
 using System.IO;
+using Newtonsoft.Json.Schema;
+using Newtonsoft.Json;
+using System.Runtime.CompilerServices;
+using Serilog.Context;
+using CTU60GLib.CollisionTable;
+using Serilog;
+using System.Data.Common;
 
 namespace CTU60G
 {
@@ -20,17 +27,14 @@ namespace CTU60G
     {
         private readonly ILogger<Worker> _logger;
         private readonly WorkerOptions _workerOptions;
-        private readonly IHostApplicationLifetime _applifetime;
+        private readonly EmailOptions _emailOptions;
+        private EmailService mailing;
 
-        public Worker(ILogger<Worker> logger, IHostApplicationLifetime appLifetime, WorkerOptions workerOptions)
+        public Worker(ILogger<Worker> logger, IHostApplicationLifetime appLifetime, WorkerOptions workerOptions, EmailOptions emailOptions)
         {
             _logger = logger;
             _workerOptions = workerOptions;
-            _applifetime = appLifetime;
-
-            _applifetime.ApplicationStarted.Register(OnStarted);
-            _applifetime.ApplicationStopping.Register(OnStopping);
-            _applifetime.ApplicationStopped.Register(OnStopped);
+            _emailOptions = emailOptions;
         }
 
         private enum SourceDataType
@@ -39,77 +43,21 @@ namespace CTU60G
             FILE,
             ERR
         }
-
-        private SourceDataType GetSourceDataType()
-        {
-            Uri uriResult;
-            Uri.TryCreate(_workerOptions.DataURLOrFilePath, UriKind.Absolute, out uriResult);
-            if (uriResult == null) return SourceDataType.ERR;
-            else if (uriResult.Scheme == Uri.UriSchemeHttp || uriResult.Scheme == Uri.UriSchemeHttps) return SourceDataType.URL;
-            if (uriResult.IsFile && File.Exists(uriResult.AbsolutePath)) return SourceDataType.FILE;
-
-            return SourceDataType.ERR;
-            
-        }
-
         protected override async Task ExecuteAsync(CancellationToken stoppingToken)
         {
-            
             while (!stoppingToken.IsCancellationRequested)
             {
-                SourceDataType sourceDataType;
-                if (_workerOptions.CTULogin == string.Empty || _workerOptions.CTUPass == string.Empty)
-                {
-                    _logger.LogError("Missing credentials for www.60ghz.ctu.cz");
-                    await StopAsync(stoppingToken);
-                    return;
-                }
-                else if(_workerOptions.DataURLOrFilePath == string.Empty)
-                {
-                    _logger.LogError("Missing data source for www.60ghz,ctu.cz");
-                    await StopAsync(stoppingToken);
-                    return;
-                }
-                else if( (sourceDataType = GetSourceDataType()) == SourceDataType.ERR)
-                {
-                    _logger.LogError("Not valid file path or web url");
-                    await StopAsync(stoppingToken);
-                    return;
-                }
+                SourceDataType sourceDataType = default;
+                await CheckWorkerOptionValues(stoppingToken, sourceDataType);
+                mailing = CheckEmailOptionValues();
 
                 _logger.LogInformation("Loading data");
-                string data = (sourceDataType == SourceDataType.FILE)?
-                    File.ReadAllText(_workerOptions.DataURLOrFilePath) :
-                    new WebClient().DownloadString(_workerOptions.DataURLOrFilePath);
+                string loadedData = await LoadData(sourceDataType);
 
-                _logger.LogInformation("DeserializingData");
-                List<WirelessSite> sites = new List<WirelessSite>();
-                try
-                {
-                    var jObj = JObject.Parse(data).Children().Children();
-                    foreach (var site in jObj)
-                    {
-                        try
-                        {
-                            sites.Add(site.ToObject<WirelessSite>());
-                        }
-                        catch (Exception)
-                        {
-                            _logger.LogWarning($"Cannot deserialize part, skiping:\n{site.ToString()}");
-                        }
-                        
-                    }
-
-                }
-                catch (Exception e)
-                {
-                    _logger.LogError("Source data are not seriazible");
-                    await StopAsync(stoppingToken);
-                    return;
-                }
-
-
+                _logger.LogInformation("parsing data");
+                List<WirelessSite> sites = await ParseData(stoppingToken, loadedData);
                 
+                //todo make ctuClient idisposable
                 CTUClient client = new CTUClient();
                 _logger.LogInformation("LoggingIn");
                 try
@@ -135,93 +83,157 @@ namespace CTU60G
                     _logger.LogWarning("Shuting service down");
                     return;
                 }
-
+                _logger.LogInformation("LoggedIn");
 
 #if DEBUG
-                List<Client.Json.CtuWirelessUnit> qq = await client.GetMyStationsAsync();
-                List<string> alreadyRemoved = new List<string>();
-                foreach (var item in qq)
-                {
-                    if (item.Name == "test")
-                    {
-                        if (!alreadyRemoved.Contains(item.Id))
-                        {
-                            await client.DeleteConnectionAsync(item.Id);
-                            alreadyRemoved.Add(item.IdStationPair);
-                        }
-
-
-                    }
-                }
+                deleteAllPreviousData(client);
 #endif
 
-                #region
-                FixedP2PPair conn;
-                WigigPTMPUnitInfo wigig;
-                try
-                {
-                    conn = new FixedP2PPair(
-                   new FixedStationInfo(
-                       "test",
-                       "",
-                       "6F:5E:4D:3C:2B:1A",
-                       "15.79548252828888",
-                       "49.95501062285150",
-                       "30",
-                       "2160",
-                       "4",
-                       "64800",
-                       "12"
-                       ),
-                   new FixedStationInfo(
-                       "test",
-                       "0123456789",
-                       "",
-                       "15.79980922061566",
-                       "49.95731458058119",
-                       "30",
-                       "2160",
-                       "4",
-                       "64800",
-                       "12"));
-
-                     wigig = new WigigPTMPUnitInfo(
-                        "test",
-                        "",
-                        "6F:5E:4D:3C:2B:1A",
-                        "15.987315748193009",
-                        "49.63796777844475",
-                        "30",
-                        "2160",
-                        "4",
-                        "64800",
-                        "",
-                        "0");
-                }
-                catch (Exception e)
-                {
-
-                    throw;
-                }
-                //RegistrationJournal rj = await client.AddPTPConnectionAsync(conn);
-                //RegistrationJournal rj2 = await client.AddWIGIG_PTP_PTMPConnectionAsync(wigig);
-
-                #endregion
                 foreach (var site in sites)
                 {
-                    if(site.Ap != null && site.Stations.Count == 1)
+                    try
                     {
-                        //p2p
+                        if (site.Infos.SiteType == "ptp")
+                        {
+                            ProcessRegistrationJournal(await client.AddPTPConnectionAsync(WirellesUnitFactory.CreatePTP(site)),site);
+                        }
+                        else if (site.Infos.SiteType == "ptmp")
+                        {
+                            ProcessRegistrationJournal( await client.AddWIGIG_PTP_PTMPConnectionAsync(WirellesUnitFactory.CreateWigigPTMP(site)),site);
+                        }
+                        else
+                        {
+                            _logger.LogWarning($"{site.Infos.Ssid} site type is missing, dont know where to publish:\n" +
+                             $"original source:\n" +
+                             JsonConvert.SerializeObject(site, Formatting.Indented));
+                        }
                     }
-                    //else if()
+                    catch (MissingParameterException e)
+                    {
+                        _logger.LogWarning($"{site.Infos.Ssid} will not be possible to publish, because of missing critical information:\n" +
+                            $"{e.Message}\n" + 
+                            $"original source:\n" +
+                            JsonConvert.SerializeObject(site, Formatting.Indented));
+                    }
+                    catch(InvalidPropertyValueException e)
+                    {
+                        _logger.LogWarning($"{site.Infos.Ssid} will not be possible to publish, because of invalid critical information:\n" +
+                            $"Expected value: {e.ExpectedVauleInfo}\n" +
+                            $"Current value: {e.CurrentValue}\n" +
+                            $"original source:\n" +
+                            JsonConvert.SerializeObject(site, Formatting.Indented));
+                    }
+                    
 
                 }
 
-
-                
-                
-                await Task.Delay(1);
+                using(LogContext.PushProperty("test", 1))
+                {
+                    _logger.LogInformation("Ahoj {test}");
+                    await Task.Delay(100);
+                    using(LogContext.PushProperty("test",2))
+                    {
+                        _logger.LogInformation("Ahoj {test}");
+                    }    
+                }
+                _logger.LogInformation("allDone");
                 break;
+            }
+
+            void ProcessRegistrationJournal(RegistrationJournal regJournal, WirelessSite site)
+            {
+                switch (regJournal.Phase)
+                {
+                    case RegistrationJournalPhaseEnum.InputValidation: _logger.LogWarning($"Publication was not possible due to Invalid values\n" +
+                        $"No record were created");
+                        break;
+                    case RegistrationJournalPhaseEnum.Localization:
+                        {
+                            if (regJournal.ThrownException.GetType() == typeof(WebServerException))
+                            {
+                                using(LogContext.PushProperty("No record",1))
+                                {
+                                    _logger.LogWarning($"Publication was not possible due to unexpected web behaviour\n" +
+                                                                                                                    $"No record were created");
+                                }
+                                
+                            }
+                            else
+                            {
+                                using(LogContext.PushProperty("No record",1))
+                                {
+                                    _logger.LogWarning($"Publication was not possible due to unexpected behaviour\n" +
+                                                $"No record were created");
+                                }
+                                
+                            }
+                        }
+                        break;
+                    case RegistrationJournalPhaseEnum.TechnicalSpecification:
+                        {
+                            if (regJournal.ThrownException.GetType() == typeof(WebServerException))
+                            {
+                                using (LogContext.PushProperty("record", "Draft"))
+                                {
+                                    _logger.LogWarning($"Publication was not possible due to unexpected web behaviour\n" +
+                                                     "Record is now in state {record}");
+                                }
+                            }
+                            else
+                            {
+                                using (LogContext.PushProperty("record", "Draft"))
+                                {
+                                    _logger.LogWarning($"Publication was not possible due to unexpected behaviour\n" +
+                                                        "Record is now in state {record}");
+                                }
+                            }    
+                        }
+                        break;
+                    case RegistrationJournalPhaseEnum.CollissionSummary:
+                        {
+                            if (regJournal.ThrownException.GetType() == typeof(WebServerException))
+                            {
+                                using (LogContext.PushProperty("record", "WAITING"))
+                                {
+                                    _logger.LogWarning($"Publication was not possible due to unexpected web behaviour\n" +
+                                                     "Record is now in state {record}");
+                                }
+                            }
+                            else if(regJournal.ThrownException.GetType() == typeof(CollisionDetectedException))
+                            {
+                                using(LogContext.PushProperty("record","WAITING"))
+                                _logger.LogWarning($"Publication was not possible due to possible collision with another connection\n" +
+                                                     "Record is now in state {record}");
+                                string message = $"detected collisions\n";
+                                foreach (var item in regJournal.CollisionStations)
+                                {
+                                    message += $"{item.Id} {item.Name} {item.Type} {item.Owned} {item.Link}\n";
+                                }
+
+                                mailing.Send("collision detected", message);
+                            }
+                            else
+                            {
+                                using (LogContext.PushProperty("record", "WAITING"))
+                                {
+                                    _logger.LogWarning($"Publication was not possible due to unexpected behaviour\n" +
+                                                        "Record is now in state {record}");
+                                }
+                            }
+                        }
+                        break;
+                    case RegistrationJournalPhaseEnum.Published:
+                        {
+                            using (LogContext.PushProperty("record", "PUBLISHED"))
+                            {
+                                _logger.LogWarning($"Publication was successfully published\n" +
+                                                    "Record is now in state {record}");
+                            }
+                        }
+                        break;
+                    default:
+                        break;
+                }
             }
         }
 
@@ -231,26 +243,104 @@ namespace CTU60G
             await Task.CompletedTask;
         }
 
-        private void OnStarted()
+        private SourceDataType GetSourceDataType()
         {
-            
-            _logger.LogInformation("OnStarted has been called.");
+            Uri uriResult;
+            Uri.TryCreate(_workerOptions.DataURLOrFilePath, UriKind.Absolute, out uriResult);
+            if (uriResult == null) return SourceDataType.ERR;
+            else if (uriResult.Scheme == Uri.UriSchemeHttp || uriResult.Scheme == Uri.UriSchemeHttps) return SourceDataType.URL;
+            if (uriResult.IsFile && File.Exists(uriResult.AbsolutePath)) return SourceDataType.FILE;
 
-            // Perform post-startup activities here
+            return SourceDataType.ERR;
+
+        }
+        private async Task CheckWorkerOptionValues(CancellationToken stoppingToken, SourceDataType sourceDataType)
+        {
+            if (_workerOptions.CTULogin == string.Empty || _workerOptions.CTUPass == string.Empty)
+            {
+                _logger.LogError("Missing credentials for www.60ghz.ctu.cz");
+                await StopAsync(stoppingToken);
+                return;
+            }
+            else if (_workerOptions.DataURLOrFilePath == string.Empty)
+            {
+                _logger.LogError("Missing data source for www.60ghz,ctu.cz");
+                await StopAsync(stoppingToken);
+                return;
+            }
+            else if ((sourceDataType = GetSourceDataType()) == SourceDataType.ERR)
+            {
+                _logger.LogError("Not valid file path or web url");
+                await StopAsync(stoppingToken);
+                return;
+            }
         }
 
-        private void OnStopping()
+        private EmailService CheckEmailOptionValues()
         {
-            _logger.LogInformation("OnStopping has been called.");
-
-            // Perform on-stopping activities here
+            if (_emailOptions.Host != string.Empty &&
+                        _emailOptions.User != string.Empty &&
+                        _emailOptions.ToEmails.Count != 0 &&
+                        _emailOptions.FromEmail != string.Empty &&
+                        _emailOptions.Password != string.Empty)
+                return new EmailService(_emailOptions, System.Net.Mail.MailPriority.High, true);
+            return null;
         }
 
-        private void OnStopped()
+        private async Task<string> LoadData(SourceDataType sourceDataType)
         {
-            _logger.LogInformation("OnStopped has been called.");
 
-            // Perform post-stopped activities here
+            //todo check if readable + secure reading
+            string data = (sourceDataType == SourceDataType.FILE) ?
+                    File.ReadAllText(_workerOptions.DataURLOrFilePath) :
+                    new WebClient().DownloadString(_workerOptions.DataURLOrFilePath);
+
+            return data;
+        }
+
+        private async Task<List<WirelessSite>> ParseData(CancellationToken stoppingToken, string loadedData)
+        {
+            List<WirelessSite> sites = new List<WirelessSite>();
+            try
+            {
+
+                var jObj = JObject.Parse(loadedData).Children().Children();
+                foreach (var site in jObj)
+                {
+                    try
+                    {
+                        sites.Add(site.ToObject<WirelessSite>());
+                    }
+                    catch (Exception) // if general structure was ok but in propertyes is for instance forbiden character this exception will ocure and only part of whole data will be skipped.
+                    {
+                        _logger.LogWarning($"Cannot deserialize part, skiping:\n{site.ToString()}");
+                    }
+
+                }
+
+            }
+            catch (Exception e) // error in general structure, data are not usable
+            {
+                _logger.LogError("Source data are not seriazible");
+                await StopAsync(stoppingToken);
+                return null;
+            }
+
+            return sites;
+        }
+
+        private async void deleteAllPreviousData(CTUClient client)
+        {
+            List<Client.Json.CtuWirelessUnit> toRemove = await client.GetMyStationsAsync();
+            List<string> alreadyRemoved = new List<string>();
+            foreach (var item in toRemove)
+            {
+                    if (!alreadyRemoved.Contains(item.Id))
+                    {
+                        await client.DeleteConnectionAsync(item.Id);
+                        alreadyRemoved.Add(item.IdStationPair);
+                    }
+            }
         }
 
     }

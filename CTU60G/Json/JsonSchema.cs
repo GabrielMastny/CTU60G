@@ -12,9 +12,6 @@
         [JsonProperty("infos", Required = Required.Always)]
         public WirelessSiteInfo Infos { get; set; }
 
-        [JsonProperty("site_type", NullValueHandling = NullValueHandling.Ignore)]
-        public string SiteType { get; set; }
-
         [JsonProperty("stations", NullValueHandling = NullValueHandling.Ignore)]
         public List<WirelessUnit> Stations { get; set; }
 
@@ -77,6 +74,9 @@
 
         [JsonProperty("subnet_id", NullValueHandling = NullValueHandling.Ignore)]
         public string SubnetId { get; set; }
+
+        [JsonProperty("site_type", NullValueHandling = NullValueHandling.Ignore)]
+        public string SiteType { get; set; }
 
     }
 }
