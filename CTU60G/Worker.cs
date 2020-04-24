@@ -110,32 +110,31 @@ namespace CTU60G
                     }
                     catch (MissingParameterException e)
                     {
-                        _logger.LogWarning($"{site.Infos.Ssid} will not be possible to publish, because of missing critical information:\n" +
-                            $"{e.Message}\n" + 
+                        using(LogContext.PushProperty("ci", "missing critical information"))
+                        {
+                            _logger.LogWarning($"{site.Infos.Ssid} will not be possible to publish, because of" + "{ci}:\n" +
+                            $"{e.Message}\n" +
                             $"original source:\n" +
                             JsonConvert.SerializeObject(site, Formatting.Indented));
+                        }
+                        
                     }
                     catch(InvalidPropertyValueException e)
                     {
-                        _logger.LogWarning($"{site.Infos.Ssid} will not be possible to publish, because of invalid critical information:\n" +
+                        using (LogContext.PushProperty("ci", "invalid critical information"))
+                        {
+                            _logger.LogWarning($"{site.Infos.Ssid} will not be possible to publish, because of" +"{ci} :\n" +
                             $"Expected value: {e.ExpectedVauleInfo}\n" +
                             $"Current value: {e.CurrentValue}\n" +
                             $"original source:\n" +
                             JsonConvert.SerializeObject(site, Formatting.Indented));
+                        }
                     }
                     
 
                 }
 
-                using(LogContext.PushProperty("test", 1))
-                {
-                    _logger.LogInformation("Ahoj {test}");
-                    await Task.Delay(100);
-                    using(LogContext.PushProperty("test",2))
-                    {
-                        _logger.LogInformation("Ahoj {test}");
-                    }    
-                }
+                
                 _logger.LogInformation("allDone");
                 break;
             }
@@ -204,13 +203,7 @@ namespace CTU60G
                                 using(LogContext.PushProperty("record","WAITING"))
                                 _logger.LogWarning($"Publication was not possible due to possible collision with another connection\n" +
                                                      "Record is now in state {record}");
-                                string message = $"detected collisions\n";
-                                foreach (var item in regJournal.CollisionStations)
-                                {
-                                    message += $"{item.Id} {item.Name} {item.Type} {item.Owned} {item.Link}\n";
-                                }
-
-                                mailing.Send("collision detected", message);
+                                NotifyViaMail(regJournal);
                             }
                             else
                             {
@@ -235,6 +228,25 @@ namespace CTU60G
                         break;
                 }
             }
+        }
+
+        private void NotifyViaMail(RegistrationJournal regJournal)
+        {
+            if(mailing != null)
+            {
+                string message = $"<p><a href=\"https://60ghz.ctu.cz/en/station/{regJournal.RegistrationId}/3\" target=\"_blank\" rel=\"noopener\">{regJournal.RegistrationId}</a> is enterfering with stations listed below</p>";
+                
+                message += "<table><tbody>";
+                message += "<tr><td> Id </td><td> name </td ><td> owned </td><td> type </td></tr> ";
+                foreach (var item in regJournal.CollisionStations)
+                {
+                    message += $"<tr><td> {item.Id} </td><td><a href = \"https://60ghz.ctu.cz/en/station/{item.Id}/3\" target = \"_blank\" rel = \"noopener\" > {item.Name} </a></td><td> {item.Owned} </td><td> {item.Type} </td>";
+
+                }
+                message += "</tr></tbody></table> ";
+                mailing.Send("collision detected", message);
+            }
+            
         }
 
         public override async Task StopAsync(CancellationToken stoppingToken)
