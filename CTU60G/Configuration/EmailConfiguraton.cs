@@ -1,13 +1,14 @@
-﻿using System;
+﻿using CTU60G.Configuration;
+using System;
 using System.Collections.Generic;
 using System.Text;
 
 namespace CTU60G
 {
-    public class EmailOptions
+    public class EmailConfiguraton : IEmailConfiguration
     {
         public string Host { get; set; }
-        public int Port { get; set; }
+        public string Port { get; set; }
         public string EnableSsl { get; set; }
         public string User { get; set; }
         public string Password { get; set; }

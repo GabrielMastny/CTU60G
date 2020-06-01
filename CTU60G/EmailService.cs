@@ -59,15 +59,15 @@ namespace CTU60G
 
         private bool isHTML;
         private MailPriority priority;
-        private EmailOptions config;
+        private EmailConfiguraton config;
 
-        public EmailService(EmailOptions conf, MailPriority Priority, bool IsHTLMmsg)
+        public EmailService(EmailConfiguraton conf, MailPriority Priority, bool IsHTLMmsg)
         {
             config = conf;
             isHTML = IsHTLMmsg;
             priority = Priority;
         }
-        public EmailService(EmailOptions conf)
+        public EmailService(EmailConfiguraton conf)
         {
             config = conf;
             isHTML = false;
@@ -99,7 +99,7 @@ namespace CTU60G
                 msg.To.Add(item);
             }
 
-            using(SmtpClient client = new SmtpClient(config.Host,config.Port))
+            using(SmtpClient client = new SmtpClient(config.Host,int.Parse(config.Port)))
             {
                 client.UseDefaultCredentials = false;
                 client.Credentials = new System.Net.NetworkCredential(config.User, config.Password);

@@ -13,28 +13,26 @@ using Client.Json;
 using CTU60GLib;
 using CTU60GLib.Exceptions;
 using System.IO;
-using Newtonsoft.Json.Schema;
 using Newtonsoft.Json;
-using System.Runtime.CompilerServices;
 using Serilog.Context;
-using CTU60GLib.CollisionTable;
-using Serilog;
-using System.Data.Common;
+using CTU60G.Configuration;
+using System.Net.Http;
 
 namespace CTU60G
 {
     public class Worker : BackgroundService, IDisposable
     {
         private readonly ILogger<Worker> _logger;
-        private readonly WorkerOptions _workerOptions;
-        private readonly EmailOptions _emailOptions;
+        private readonly WorkerConfiguration _workerOptions;
+        private readonly EmailConfiguraton _emailOptions;
         private EmailService mailing;
 
-        public Worker(ILogger<Worker> logger, IHostApplicationLifetime appLifetime, WorkerOptions workerOptions, EmailOptions emailOptions)
+        public Worker(ILogger<Worker> logger, IHostApplicationLifetime appLifetime, IWorkerConfiguration workerOptions, IEmailConfiguration emailOptions, IBehaviourConfiguration behaviourOptoins)
         {
             _logger = logger;
-            _workerOptions = workerOptions;
-            _emailOptions = emailOptions;
+            _workerOptions = workerOptions as WorkerConfiguration;
+            _emailOptions = emailOptions as EmailConfiguraton;
+            WirellesUnitFactory.Behaviour = behaviourOptoins as BehaviourConfiguration;
         }
 
         private enum SourceDataType
@@ -43,190 +41,325 @@ namespace CTU60G
             FILE,
             ERR
         }
-        protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+        protected override async Task ExecuteAsync(CancellationToken cancellationToken)
         {
-            while (!stoppingToken.IsCancellationRequested)
-            {
-                SourceDataType sourceDataType = default;
-                await CheckWorkerOptionValues(stoppingToken, sourceDataType);
-                mailing = CheckEmailOptionValues();
 
+            SourceDataType sourceDataType = default;
+            await CheckWorkerOptionValues(cancellationToken, sourceDataType);
+            mailing = CheckEmailOptionValues();
+
+                //Loading source data from file or url
                 _logger.LogInformation("Loading data");
                 string loadedData = await LoadData(sourceDataType);
 
-                _logger.LogInformation("parsing data");
-                List<WirelessSite> sites = await ParseData(stoppingToken, loadedData);
-                
-                //todo make ctuClient idisposable
-                CTUClient client = new CTUClient();
-                _logger.LogInformation("LoggingIn");
+                //parsing loaded source data
+                _logger.LogInformation("parsing loaded data");
+                List<WirelessSite> parsedSites = await ParseData(cancellationToken, loadedData);
                 try
                 {
-                    await client.LoginAsync(_workerOptions.CTULogin, _workerOptions.CTUPass);
+                    _logger.LogInformation("LoggingIn");
+                    using (CTUClient client = new CTUClient(_workerOptions.CTULogin, _workerOptions.CTUPass, _workerOptions.SignalIsolationConsentIfMyOwn))
+                    {
+                        _logger.LogInformation("LoggedIn");
+                        OnSiteData ctuMetaData = new OnSiteData(await client.GetMyStationsAsync());
+                        foreach (var site in parsedSites)
+                        {
+                                if ((DateTime.Now - ctuMetaData.LasTimeRefreshed).TotalSeconds > 10) ctuMetaData.Refresh(await client.GetMyStationsAsync());
+
+                                if (site.Infos.SiteType == "ptp")
+                                {
+                                    List<FixedP2PPair> pairs = (ProcessWUnitCreation(site) as List<FixedP2PPair>);
+                                    if (pairs != null)
+                                    {
+                                        foreach (var pair in pairs)
+                                        {
+                                            RegistrationJournal regJournal = default;
+                                            if (pair.StationB.CTUId > 0) // update already existing site
+                                            {
+                                                ProcessRegistrationJournal(regJournal = await client.UpdatePTPConnectionAsync(pair), site);
+                                            }
+                                            else // create new site
+                                            {
+                                                ProcessRegistrationJournal(regJournal = await client.AddPTPConnectionAsync(pair), site);
+                                                if (regJournal.Phase == RegistrationJournalPhaseEnum.Published && !string.IsNullOrEmpty(_workerOptions.ResponseWithCTUID))
+                                                {
+                                                    HttpClient cl = new HttpClient();
+                                                    HttpResponseMessage rm = await cl.GetAsync(_workerOptions.ResponseWithCTUID + $"&id={pair.StationA.OwnerId}&ctuId={regJournal.RegistrationId}");
+                                                    HttpResponseMessage rm2 = await cl.GetAsync(_workerOptions.ResponseWithCTUID + $"&id={pair.StationB.OwnerId}&ctuId={regJournal.RegistrationId}");
+                                                }
+                                            }
+
+                                        }
+                                    }
+                                    
+                                }
+                                else if (site.Infos.SiteType == "ptmp")
+                                {
+                                    WigigPTMPUnitInfo wigig = (ProcessWUnitCreation(site) as WigigPTMPUnitInfo);
+                                    if (wigig != null)
+                                    {
+                                        ProcessRegistrationJournal(await client.AddWIGIG_PTP_PTMPConnectionAsync(wigig), site);
+                                    }
+                                    
+                                }
+                                else if (site.Infos.SiteType == "delete")
+                                {
+                                    ProcessDeletion(site, client);
+                                }
+                                else
+                                {
+                                    _logger.LogWarning($"{site.Infos.Ssid} site type is missing or has unrecognizable value, dont know where to publish:\n" +
+                                        $"original source:\n" +
+                                        JsonConvert.SerializeObject(site, Formatting.Indented));
+                                }
+                        }
+                    }
                 }
-                catch (InvalidMailOrPasswordException )
+                catch (InvalidMailOrPasswordException)
                 {
                     _logger.LogError("Invalid login credentials");
                     _logger.LogWarning("Shuting service down");
                     return;
                 }
-                catch (WebServerException )
+                catch (WebServerException)
                 {
                     _logger.LogError("Web server exception occured during login");
                     _logger.LogWarning("Shuting service down");
                     return;
                 }
+                
                 catch (Exception e)
                 {
-
                     _logger.LogError("unknown exception occured during login");
                     _logger.LogWarning("Shuting service down");
                     return;
                 }
-                _logger.LogInformation("LoggedIn");
-
-#if DEBUG
-                deleteAllPreviousData(client);
-#endif
-
-                foreach (var site in sites)
-                {
-                    try
-                    {
-                        if (site.Infos.SiteType == "ptp")
-                        {
-                            ProcessRegistrationJournal(await client.AddPTPConnectionAsync(WirellesUnitFactory.CreatePTP(site)),site);
-                        }
-                        else if (site.Infos.SiteType == "ptmp")
-                        {
-                            ProcessRegistrationJournal( await client.AddWIGIG_PTP_PTMPConnectionAsync(WirellesUnitFactory.CreateWigigPTMP(site)),site);
-                        }
-                        else
-                        {
-                            _logger.LogWarning($"{site.Infos.Ssid} site type is missing, dont know where to publish:\n" +
-                             $"original source:\n" +
-                             JsonConvert.SerializeObject(site, Formatting.Indented));
-                        }
-                    }
-                    catch (MissingParameterException e)
-                    {
-                        using(LogContext.PushProperty("ci", "missing critical information"))
-                        {
-                            _logger.LogWarning($"{site.Infos.Ssid} will not be possible to publish, because of" + "{ci}:\n" +
-                            $"{e.Message}\n" +
-                            $"original source:\n" +
-                            JsonConvert.SerializeObject(site, Formatting.Indented));
-                        }
-                        
-                    }
-                    catch(InvalidPropertyValueException e)
-                    {
-                        using (LogContext.PushProperty("ci", "invalid critical information"))
-                        {
-                            _logger.LogWarning($"{site.Infos.Ssid} will not be possible to publish, because of" +"{ci} :\n" +
-                            $"Expected value: {e.ExpectedVauleInfo}\n" +
-                            $"Current value: {e.CurrentValue}\n" +
-                            $"original source:\n" +
-                            JsonConvert.SerializeObject(site, Formatting.Indented));
-                        }
-                    }
-                    
-
-                }
-
-                
                 _logger.LogInformation("allDone");
-                break;
-            }
+            return;
 
+            void ProcessUserApiRespnse()
+            {
+
+            }
             void ProcessRegistrationJournal(RegistrationJournal regJournal, WirelessSite site)
             {
-                switch (regJournal.Phase)
+                using(LogContext.PushProperty("phase",regJournal.Phase.ToString()))
+                using (LogContext.PushProperty("type", regJournal.Type.ToString()))
+                using (LogContext.PushProperty("id", regJournal.RegistrationId))
                 {
-                    case RegistrationJournalPhaseEnum.InputValidation: _logger.LogWarning($"Publication was not possible due to Invalid values\n" +
-                        $"No record were created");
-                        break;
-                    case RegistrationJournalPhaseEnum.Localization:
-                        {
-                            if (regJournal.ThrownException.GetType() == typeof(WebServerException))
+                    switch (regJournal.Phase)
+                    {
+                        case RegistrationJournalPhaseEnum.InputValidation:
                             {
-                                using(LogContext.PushProperty("No record",1))
-                                {
-                                    _logger.LogWarning($"Publication was not possible due to unexpected web behaviour\n" +
-                                                                                                                    $"No record were created");
-                                }
-                                
+                                _logger.LogWarning("{phase}\nid:{id}\n{type}\nwas not possible due to Invalid values\n" +
+                                "No records were created/updated");
                             }
-                            else
+                            break;
+                        case RegistrationJournalPhaseEnum.Localization:
                             {
-                                using(LogContext.PushProperty("No record",1))
+                                if (regJournal.ThrownException.GetType() == typeof(WebServerException))
                                 {
-                                    _logger.LogWarning($"Publication was not possible due to unexpected behaviour\n" +
-                                                $"No record were created");
+                                    _logger.LogWarning("{phase}\nid:{id}\n{type}\nwas not possible due to unexpected web behaviour\n" +
+                                    $"No record were created");
                                 }
-                                
+                                else
+                                {
+                                    _logger.LogWarning("{phase}\nid:{id}\n{type}\nwas not possible due to unexpected behaviour\n" +
+                                                    $"No record were created");
+                                }
                             }
-                        }
-                        break;
-                    case RegistrationJournalPhaseEnum.TechnicalSpecification:
-                        {
-                            if (regJournal.ThrownException.GetType() == typeof(WebServerException))
+                            break;
+                        case RegistrationJournalPhaseEnum.TechnicalSpecification:
                             {
                                 using (LogContext.PushProperty("record", "Draft"))
                                 {
-                                    _logger.LogWarning($"Publication was not possible due to unexpected web behaviour\n" +
-                                                     "Record is now in state {record}");
+                                    if (regJournal.ThrownException.GetType() == typeof(WebServerException))
+                                    {
+                                            _logger.LogWarning("{phase}\nid:{id}\n{type}\nwas not possible due to unexpected web behaviour\n" +
+                                                             "Record is now in state {record}");
+                                    }
+                                    else
+                                    {
+                                            _logger.LogWarning("{phase}\nid:{id}\n{type}\nwas not possible due to unexpected behaviour\n" +
+                                                                "Record is now in state {record}");
+                                    }
                                 }
+                                    
                             }
-                            else
-                            {
-                                using (LogContext.PushProperty("record", "Draft"))
-                                {
-                                    _logger.LogWarning($"Publication was not possible due to unexpected behaviour\n" +
-                                                        "Record is now in state {record}");
-                                }
-                            }    
-                        }
-                        break;
-                    case RegistrationJournalPhaseEnum.CollissionSummary:
-                        {
-                            if (regJournal.ThrownException.GetType() == typeof(WebServerException))
+                            break;
+                        case RegistrationJournalPhaseEnum.CollissionSummary:
                             {
                                 using (LogContext.PushProperty("record", "WAITING"))
                                 {
-                                    _logger.LogWarning($"Publication was not possible due to unexpected web behaviour\n" +
-                                                     "Record is now in state {record}");
+                                    if (regJournal.ThrownException.GetType() == typeof(WebServerException))
+                                    {
+                                        _logger.LogWarning("{phase}\nid:{id}\n{type}\nwas not possible due to unexpected web behaviour\n" +
+                                        "Record is now in state {record}");
+                                    }
+                                    else if (regJournal.ThrownException.GetType() == typeof(CollisionDetectedException))
+                                    {
+                                        _logger.LogWarning("{phase}\nid:{id}\n{type}\nwas not possible due to possible collision with another connection\n" +
+                                                                 "Record is now in state {record}");
+                                        NotifyViaMail(regJournal);
+                                    }
+                                    else
+                                    {
+                                        _logger.LogWarning("{phase}\nid:{id}\n{type}\nwas not possible due to unexpected behaviour\n" +
+                                                                "Record is now in state {record}");
+                                    }
                                 }
+                                    
                             }
-                            else if(regJournal.ThrownException.GetType() == typeof(CollisionDetectedException))
+                            break;
+                        case RegistrationJournalPhaseEnum.Published:
                             {
-                                using(LogContext.PushProperty("record","WAITING"))
-                                _logger.LogWarning($"Publication was not possible due to possible collision with another connection\n" +
-                                                     "Record is now in state {record}");
-                                NotifyViaMail(regJournal);
-                            }
-                            else
-                            {
-                                using (LogContext.PushProperty("record", "WAITING"))
+                                using (LogContext.PushProperty("record", "PUBLISHED"))
                                 {
-                                    _logger.LogWarning($"Publication was not possible due to unexpected behaviour\n" +
-                                                        "Record is now in state {record}");
+                                    _logger.LogInformation("{phase}\nid:{id}\n{type}\nwas successfully published\n" +
+                                    "Record is now in state {record}");
+
                                 }
                             }
-                        }
-                        break;
-                    case RegistrationJournalPhaseEnum.Published:
-                        {
-                            using (LogContext.PushProperty("record", "PUBLISHED"))
-                            {
-                                _logger.LogWarning($"Publication was successfully published\n" +
-                                                    "Record is now in state {record}");
-                            }
-                        }
-                        break;
-                    default:
-                        break;
+                            break;
+                        default:
+                            break;
+                    }
                 }
+                    
+            }
+            async Task ZeroDatabase(List<WirelessSite> sites)
+            {
+                foreach (var site in sites)
+                {
+                    HttpClient cl = new HttpClient();
+                    if (site.Ap != null)
+                    {
+                        foreach (var item in site?.Ap)
+                        {
+                             if(!string.IsNullOrEmpty(_workerOptions.ResponseOnDelete))
+                            {
+                                HttpResponseMessage rm2 = await cl.GetAsync(_workerOptions.ResponseOnDelete + $"&id={item.Id}");
+                                if (await rm2.Content.ReadAsStringAsync() != "ok")
+                                {
+
+                                }
+                            }
+                                
+                        }
+                    }
+                    if (site.Stations != null)
+                    {
+                        foreach (var item in site?.Stations)
+                        {
+                            if (!string.IsNullOrEmpty(_workerOptions.ResponseOnDelete))
+                            {
+                                HttpResponseMessage rm2 = await cl.GetAsync(_workerOptions.ResponseOnDelete + $"&id={item.Id}");
+                                if (await rm2.Content.ReadAsStringAsync() != "ok")
+                                {
+
+                                }
+                            }
+                                                                
+                        }
+                    }
+
+
+                }
+            }
+            object ProcessWUnitCreation(WirelessSite site)
+            {
+                try
+                {
+                    if (site.Infos.SiteType == "ptp")
+                    {
+                        return WirellesUnitFactory.CreatePTP(site);
+                    }
+                    else if (site.Infos.SiteType == "ptmp")
+                    {
+                        return WirellesUnitFactory.CreateWigigPTMP(site);
+                    }
+                }
+                catch (MissingParameterException e)
+                {
+                    using (LogContext.PushProperty("ci", "missing critical information"))
+                    {
+                        _logger.LogWarning($"{site.Infos.Ssid} will not be possible to publish, because of" + "{ci}:\n" +
+                        $"{e.Message}\n" +
+                        $"original source:\n" +
+                        JsonConvert.SerializeObject(site, Formatting.Indented));
+                    }
+
+                }
+                catch (InvalidPropertyValueException e)
+                {
+                    using (LogContext.PushProperty("ci", "invalid critical information"))
+                    {
+                        _logger.LogWarning($"{site.Infos.Ssid} will not be possible to publish, because of" + "{ci} :\n" +
+                        $"Expected value: {e.ExpectedVauleInfo}\n" +
+                        $"Current value: {e.CurrentValue}\n" +
+                        $"original source:\n" +
+                        JsonConvert.SerializeObject(site, Formatting.Indented));
+                    }
+                }
+                catch (Exception e)
+                {
+
+                    throw e;
+                }
+
+                return null;
+            }
+            void ProcessDeletion(WirelessSite site, CTUClient client)
+            {
+                try
+                {
+                    if(site.Stations.Count > 0)
+                    foreach (var item in site.Stations)
+                    {
+                        List<CtuWirelessUnit> stations = default;
+                        stations = client.GetStationByIdAsync(item.CtuReported).Result;
+                    }
+                    else
+                    {
+                        List<CtuWirelessUnit> stations = default;
+                        stations =  client.GetStationByIdAsync(site.Ap.FirstOrDefault()?.CtuReported).Result;
+                        if (stations.Count > 0)
+                            client.DeleteConnectionAsync(site.Ap.FirstOrDefault()?.CtuReported);
+                    }
+                    
+                }
+                catch (Exception e)
+                {
+
+                    throw e;
+                }
+            }
+        }
+
+        private struct OnSiteData
+        {
+            private DateTime lasTimeRefreshed;
+            private List<CtuWirelessUnit> dataOnSite;
+
+            public OnSiteData(List<CtuWirelessUnit> dataOnSite)
+            {
+                this.lasTimeRefreshed = DateTime.Now;
+                this.dataOnSite = dataOnSite;
+            }
+
+            public void Refresh(List<CtuWirelessUnit> dataOnSite)
+            {
+                this.dataOnSite = dataOnSite;
+                this.lasTimeRefreshed = DateTime.Now;
+            }
+            public DateTime LasTimeRefreshed
+            {
+                get { return lasTimeRefreshed; }
+            }
+            
+            public List<CtuWirelessUnit> DataOnSite
+            {
+                get { return dataOnSite; }
             }
         }
 
@@ -317,7 +450,9 @@ namespace CTU60G
             {
 
                 var jObj = JObject.Parse(loadedData).Children().Children();
-                foreach (var site in jObj)
+                IJEnumerable<JToken> jTok = default;
+                    if (jObj != null) jTok = jObj;
+                foreach (var site in jTok)
                 {
                     try
                     {
@@ -341,7 +476,7 @@ namespace CTU60G
             return sites;
         }
 
-        private async void deleteAllPreviousData(CTUClient client)
+        private async Task deleteAllPreviousData(CTUClient client)
         {
             List<Client.Json.CtuWirelessUnit> toRemove = await client.GetMyStationsAsync();
             List<string> alreadyRemoved = new List<string>();
