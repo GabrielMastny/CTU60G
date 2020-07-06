@@ -2,9 +2,9 @@
 using System.Collections.Generic;
 using System.Text;
 
-namespace CTU60G.Configuration
+namespace CTU60G
 {
-    public interface IEmailConfiguration
+    class Mailing
     {
     }
 }

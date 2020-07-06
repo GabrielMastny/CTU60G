@@ -61,17 +61,11 @@ namespace CTU60G
         private MailPriority priority;
         private EmailConfiguraton config;
 
-        public EmailService(EmailConfiguraton conf, MailPriority Priority, bool IsHTLMmsg)
+        public EmailService(EmailConfiguraton conf, MailPriority Priority, bool IsHTLMmsg = false)
         {
             config = conf;
             isHTML = IsHTLMmsg;
             priority = Priority;
-        }
-        public EmailService(EmailConfiguraton conf)
-        {
-            config = conf;
-            isHTML = false;
-            priority = MailPriority.High;
         }
 
         private MailMessage createMsg(String subject, String body)
@@ -105,18 +99,8 @@ namespace CTU60G
                 client.Credentials = new System.Net.NetworkCredential(config.User, config.Password);
                 client.DeliveryMethod = SmtpDeliveryMethod.Network;
                 client.EnableSsl = (bool.Parse(config.EnableSsl));
-                try
-                {
-                    client.Send(msg);
-                }
-                catch (Exception e)
-                {
-
-                    throw;
-                }
-
-
-
+                    
+                client.Send(msg);
             }
             
             

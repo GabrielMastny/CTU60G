@@ -5,7 +5,7 @@ using System.Text;
 
 namespace CTU60G
 {
-    public class EmailConfiguraton : IEmailConfiguration
+    public class EmailConfiguraton
     {
         public string Host { get; set; }
         public string Port { get; set; }

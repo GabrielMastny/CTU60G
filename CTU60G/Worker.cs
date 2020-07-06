@@ -17,22 +17,29 @@ using Newtonsoft.Json;
 using Serilog.Context;
 using CTU60G.Configuration;
 using System.Net.Http;
+using Microsoft.Extensions.Options;
+using System.Diagnostics;
+using System.Reflection;
+using Serilog;
 
 namespace CTU60G
 {
-    public class Worker : BackgroundService, IDisposable
+    public class Worker : IHostedService
     {
-        private readonly ILogger<Worker> _logger;
-        private readonly WorkerConfiguration _workerOptions;
-        private readonly EmailConfiguraton _emailOptions;
+        private readonly ILogger<Worker> logger;
+        private readonly WorkerConfiguration workerOptions;
+        private readonly EmailConfiguraton emailOptions;
         private EmailService mailing;
-
-        public Worker(ILogger<Worker> logger, IHostApplicationLifetime appLifetime, IWorkerConfiguration workerOptions, IEmailConfiguration emailOptions, IBehaviourConfiguration behaviourOptoins)
+        private IHostApplicationLifetime appLifetime { get; }
+        private TaskCompletionSource<bool> TaskCompletionSource { get; } = new TaskCompletionSource<bool>();
+        Stopwatch runTime = new Stopwatch();
+        public Worker(ILogger<Worker> logger, IHostApplicationLifetime appLifetime, IOptions<WorkerConfiguration> workerOptions, IOptions<EmailConfiguraton> emailOptions, IOptions<BehaviourConfiguration> behaviourOptoins)
         {
-            _logger = logger;
-            _workerOptions = workerOptions as WorkerConfiguration;
-            _emailOptions = emailOptions as EmailConfiguraton;
-            WirellesUnitFactory.Behaviour = behaviourOptoins as BehaviourConfiguration;
+            this.logger = logger;
+            this.workerOptions = workerOptions.Value;
+            this.emailOptions = emailOptions.Value;
+            WirellesUnitFactory.Behaviour = behaviourOptoins.Value;
+            this.appLifetime = appLifetime;
         }
 
         private enum SourceDataType
@@ -41,34 +48,69 @@ namespace CTU60G
             FILE,
             ERR
         }
-        protected override async Task ExecuteAsync(CancellationToken cancellationToken)
+        
+        public Task StartAsync(CancellationToken cancellationToken)
         {
+            runTime.Start();
+            return DoWork(cancellationToken);
+        }
+        public Task StopAsync(CancellationToken cancellationToken)
+        {
+            runTime.Stop();
+            logger.LogInformation($"Task stopped, elapsed time: {runTime.Elapsed}.");
+            return TaskCompletionSource.Task;
+        }
 
+        private async Task DoWork(CancellationToken cancellationToken)
+        {
+            logger.LogInformation($"Launching CTU60G, current version: {Assembly.GetExecutingAssembly().GetName().Version}");
             SourceDataType sourceDataType = default;
-            await CheckWorkerOptionValues(cancellationToken, sourceDataType);
             mailing = CheckEmailOptionValues();
-
-                //Loading source data from file or url
-                _logger.LogInformation("Loading data");
-                string loadedData = await LoadData(sourceDataType);
-
-                //parsing loaded source data
-                _logger.LogInformation("parsing loaded data");
-                List<WirelessSite> parsedSites = await ParseData(cancellationToken, loadedData);
-                try
+            if (await CheckWorkerOptionValues(cancellationToken, sourceDataType))
+            {
+                logger.LogInformation($"Synchronization type set to: {workerOptions.Synchronization }");
+                string msg = $"Run type set to: {workerOptions.Run}";
+                msg += (workerOptions.Run == RunTypeEnum.InSpecifedTime.ToString()) ? $", app will run every day in {workerOptions.RunTimeSpecification.Hours}:{workerOptions.RunTimeSpecification.Minutes}":"";
+                msg += (workerOptions.Run == RunTypeEnum.AfterSpecifedTime.ToString()) ? $", app will run always after {workerOptions.RunTimeSpecification}":"";
+                logger.LogInformation(msg);
+                do
                 {
-                    _logger.LogInformation("LoggingIn");
-                    using (CTUClient client = new CTUClient(_workerOptions.CTULogin, _workerOptions.CTUPass, _workerOptions.SignalIsolationConsentIfMyOwn))
+                    
+                    //Loading source data from file or url
+                    logger.LogInformation("Loading data");
+                    string loadedData = default;
+                    try
                     {
-                        _logger.LogInformation("LoggedIn");
-                        OnSiteData ctuMetaData = new OnSiteData(await client.GetMyStationsAsync());
-                        foreach (var site in parsedSites)
+                        loadedData = await LoadData(sourceDataType);
+                    }
+                    catch (Exception e)
+                    {
+                        logger.LogError("Could not obtain source data, exception message:\n {0}.", e.Message);
+                        TaskCompletionSource.SetResult(false);
+                        appLifetime.StopApplication();
+                        return;
+                    }
+
+                    //parsing loaded source data
+                    logger.LogInformation("parsing loaded data");
+                    List<WirelessSite> parsedSites = await ParseData(cancellationToken, loadedData);
+                    cancellationToken.ThrowIfCancellationRequested();
+                    try
+                    {
+                        logger.LogInformation("LoggingIn");
+                        using (CTUClient client = new CTUClient(workerOptions.CTULogin, workerOptions.CTUPass, workerOptions.SignalIsolationConsentIfMyOwn))
                         {
+                            logger.LogInformation("LoggedIn");
+                            OnSiteData ctuMetaData = new OnSiteData(await client.GetMyStationsAsync());
+
+                            foreach (var site in parsedSites)
+                            {
+                                cancellationToken.ThrowIfCancellationRequested();
                                 if ((DateTime.Now - ctuMetaData.LasTimeRefreshed).TotalSeconds > 10) ctuMetaData.Refresh(await client.GetMyStationsAsync());
 
                                 if (site.Infos.SiteType == "ptp")
                                 {
-                                    List<FixedP2PPair> pairs = (ProcessWUnitCreation(site) as List<FixedP2PPair>);
+                                    List<P2PSite> pairs = (ProcessWUnitCreation(site) as List<P2PSite>);
                                     if (pairs != null)
                                     {
                                         foreach (var pair in pairs)
@@ -80,18 +122,18 @@ namespace CTU60G
                                             }
                                             else // create new site
                                             {
-                                                ProcessRegistrationJournal(regJournal = await client.AddPTPConnectionAsync(pair), site);
-                                                if (regJournal.Phase == RegistrationJournalPhaseEnum.Published && !string.IsNullOrEmpty(_workerOptions.ResponseWithCTUID))
+                                                ProcessRegistrationJournal(regJournal = await client.AddPTPSiteAsync(pair), site);
+                                                if (regJournal.Phase == RegistrationJournalPhaseEnum.Published && !string.IsNullOrEmpty(workerOptions.ResponseWithCTUID))
                                                 {
                                                     HttpClient cl = new HttpClient();
-                                                    HttpResponseMessage rm = await cl.GetAsync(_workerOptions.ResponseWithCTUID + $"&id={pair.StationA.OwnerId}&ctuId={regJournal.RegistrationId}");
-                                                    HttpResponseMessage rm2 = await cl.GetAsync(_workerOptions.ResponseWithCTUID + $"&id={pair.StationB.OwnerId}&ctuId={regJournal.RegistrationId}");
+                                                    HttpResponseMessage rm = await cl.GetAsync(workerOptions.ResponseWithCTUID + $"&id={pair.StationA.OwnerId}&ctuId={regJournal.RegistrationId}");
+                                                    HttpResponseMessage rm2 = await cl.GetAsync(workerOptions.ResponseWithCTUID + $"&id={pair.StationB.OwnerId}&ctuId={regJournal.RegistrationId}");
                                                 }
                                             }
 
                                         }
                                     }
-                                    
+
                                 }
                                 else if (site.Infos.SiteType == "ptmp")
                                 {
@@ -100,50 +142,74 @@ namespace CTU60G
                                     {
                                         ProcessRegistrationJournal(await client.AddWIGIG_PTP_PTMPConnectionAsync(wigig), site);
                                     }
-                                    
+
                                 }
-                                else if (site.Infos.SiteType == "delete")
+                                else if (site.Infos.SiteType == "delete" && workerOptions.Synchronization == SynchronizationTypeEnum.Manual.ToString())
                                 {
                                     ProcessDeletion(site, client);
                                 }
                                 else
                                 {
-                                    _logger.LogWarning($"{site.Infos.Ssid} site type is missing or has unrecognizable value, dont know where to publish:\n" +
+                                    logger.LogWarning($"{site.Infos.Ssid} site type is missing or has unrecognizable value, dont know where to publish:\n" +
                                         $"original source:\n" +
                                         JsonConvert.SerializeObject(site, Formatting.Indented));
                                 }
+                            }
                         }
                     }
-                }
-                catch (InvalidMailOrPasswordException)
-                {
-                    _logger.LogError("Invalid login credentials");
-                    _logger.LogWarning("Shuting service down");
-                    return;
-                }
-                catch (WebServerException)
-                {
-                    _logger.LogError("Web server exception occured during login");
-                    _logger.LogWarning("Shuting service down");
-                    return;
-                }
-                
-                catch (Exception e)
-                {
-                    _logger.LogError("unknown exception occured during login");
-                    _logger.LogWarning("Shuting service down");
-                    return;
-                }
-                _logger.LogInformation("allDone");
-            return;
+                    catch (InvalidMailOrPasswordException)
+                    {
+                        logger.LogError("Invalid login credentials");
+                        TaskCompletionSource.SetResult(false);
+                        appLifetime.StopApplication();
+                        return;
+                    }
+                    catch (WebServerException e)
+                    {
+                        logger.LogError($"Web server exception occured during comunication with ctu\n{e.Message} {e.Status.ToString()}\n {e.StackTrace}");
+                        TaskCompletionSource.SetResult(false);
+                        appLifetime.StopApplication();
+                        return;
+                    }
+                    catch (OperationCanceledException e)
+                    {
+                        logger.LogError($"Task was stopped as respond to system signal\n{e.Message}");
+                        TaskCompletionSource.SetResult(false);
+                        appLifetime.StopApplication();
+                        return;
+                    }
+                    catch (Exception e)
+                    {
+                        logger.LogError($"unknown exception occured during login\n{e.Message}\n {e.StackTrace}");
+                        logger.LogInformation(e.Message);
+                        logger.LogWarning("Shuting service down");
+                        TaskCompletionSource.SetResult(false);
+                        appLifetime.StopApplication();
+                        return;
+                    }
 
-            void ProcessUserApiRespnse()
-            {
-
+                    if (workerOptions.Run == RunTypeEnum.AfterSpecifedTime.ToString())
+                    {
+                        Log.Information($"task goes to sleep, will resume at {DateTime.Now + workerOptions.RunTimeSpecification}");
+                        await Task.Delay(workerOptions.RunTimeSpecification,cancellationToken);
+                    }
+                    if (workerOptions.Run == RunTypeEnum.InSpecifedTime.ToString())
+                    {
+                        TimeSpan timeToWait = DateTime.Today + workerOptions.RunTimeSpecification - DateTime.Now;
+                        if (timeToWait < TimeSpan.Zero) timeToWait += new TimeSpan(1, 0, 0, 0);
+                        Log.Information($"task goes to sleep, will resume at {DateTime.Now + timeToWait}");
+                        await Task.Delay(timeToWait,cancellationToken);
+                    }
+                }
+                while (!cancellationToken.IsCancellationRequested && (RunTypeEnum)Enum.Parse(typeof(RunTypeEnum),workerOptions.Run) != RunTypeEnum.Once);
+                logger.LogInformation("allDone");
             }
+
+            
+
             void ProcessRegistrationJournal(RegistrationJournal regJournal, WirelessSite site)
             {
-                using(LogContext.PushProperty("phase",regJournal.Phase.ToString()))
+                using (LogContext.PushProperty("phase", regJournal.Phase.ToString()))
                 using (LogContext.PushProperty("type", regJournal.Type.ToString()))
                 using (LogContext.PushProperty("id", regJournal.RegistrationId))
                 {
@@ -151,7 +217,7 @@ namespace CTU60G
                     {
                         case RegistrationJournalPhaseEnum.InputValidation:
                             {
-                                _logger.LogWarning("{phase}\nid:{id}\n{type}\nwas not possible due to Invalid values\n" +
+                                logger.LogWarning("{phase}\nid:{id}\n{type}\nwas not possible due to Invalid values\n" +
                                 "No records were created/updated");
                             }
                             break;
@@ -159,12 +225,12 @@ namespace CTU60G
                             {
                                 if (regJournal.ThrownException.GetType() == typeof(WebServerException))
                                 {
-                                    _logger.LogWarning("{phase}\nid:{id}\n{type}\nwas not possible due to unexpected web behaviour\n" +
+                                    logger.LogWarning("{phase}\nid:{id}\n{type}\nwas not possible due to unexpected web behaviour\n" +
                                     $"No record were created");
                                 }
                                 else
                                 {
-                                    _logger.LogWarning("{phase}\nid:{id}\n{type}\nwas not possible due to unexpected behaviour\n" +
+                                    logger.LogWarning("{phase}\nid:{id}\n{type}\nwas not possible due to unexpected behaviour\n" +
                                                     $"No record were created");
                                 }
                             }
@@ -175,16 +241,16 @@ namespace CTU60G
                                 {
                                     if (regJournal.ThrownException.GetType() == typeof(WebServerException))
                                     {
-                                            _logger.LogWarning("{phase}\nid:{id}\n{type}\nwas not possible due to unexpected web behaviour\n" +
-                                                             "Record is now in state {record}");
+                                        logger.LogWarning("{phase}\nid:{id}\n{type}\nwas not possible due to unexpected web behaviour\n" +
+                                                         "Record is now in state {record}");
                                     }
                                     else
                                     {
-                                            _logger.LogWarning("{phase}\nid:{id}\n{type}\nwas not possible due to unexpected behaviour\n" +
-                                                                "Record is now in state {record}");
+                                        logger.LogWarning("{phase}\nid:{id}\n{type}\nwas not possible due to unexpected behaviour\n" +
+                                                            "Record is now in state {record}");
                                     }
                                 }
-                                    
+
                             }
                             break;
                         case RegistrationJournalPhaseEnum.CollissionSummary:
@@ -193,29 +259,29 @@ namespace CTU60G
                                 {
                                     if (regJournal.ThrownException.GetType() == typeof(WebServerException))
                                     {
-                                        _logger.LogWarning("{phase}\nid:{id}\n{type}\nwas not possible due to unexpected web behaviour\n" +
+                                        logger.LogWarning("{phase}\nid:{id}\n{type}\nwas not possible due to unexpected web behaviour\n" +
                                         "Record is now in state {record}");
                                     }
                                     else if (regJournal.ThrownException.GetType() == typeof(CollisionDetectedException))
                                     {
-                                        _logger.LogWarning("{phase}\nid:{id}\n{type}\nwas not possible due to possible collision with another connection\n" +
+                                        logger.LogWarning("{phase}\nid:{id}\n{type}\nwas not possible due to possible collision with another connection\n" +
                                                                  "Record is now in state {record}");
                                         NotifyViaMail(regJournal);
                                     }
                                     else
                                     {
-                                        _logger.LogWarning("{phase}\nid:{id}\n{type}\nwas not possible due to unexpected behaviour\n" +
+                                        logger.LogWarning("{phase}\nid:{id}\n{type}\nwas not possible due to unexpected behaviour\n" +
                                                                 "Record is now in state {record}");
                                     }
                                 }
-                                    
+
                             }
                             break;
                         case RegistrationJournalPhaseEnum.Published:
                             {
                                 using (LogContext.PushProperty("record", "PUBLISHED"))
                                 {
-                                    _logger.LogInformation("{phase}\nid:{id}\n{type}\nwas successfully published\n" +
+                                    logger.LogInformation("{phase}\nid:{id}\n{type}\nwas successfully published\n" +
                                     "Record is now in state {record}");
 
                                 }
@@ -225,7 +291,7 @@ namespace CTU60G
                             break;
                     }
                 }
-                    
+
             }
             async Task ZeroDatabase(List<WirelessSite> sites)
             {
@@ -236,30 +302,30 @@ namespace CTU60G
                     {
                         foreach (var item in site?.Ap)
                         {
-                             if(!string.IsNullOrEmpty(_workerOptions.ResponseOnDelete))
+                            if (!string.IsNullOrEmpty(workerOptions.ResponseOnDelete))
                             {
-                                HttpResponseMessage rm2 = await cl.GetAsync(_workerOptions.ResponseOnDelete + $"&id={item.Id}");
+                                HttpResponseMessage rm2 = await cl.GetAsync(workerOptions.ResponseOnDelete + $"&id={item.Id}");
                                 if (await rm2.Content.ReadAsStringAsync() != "ok")
                                 {
 
                                 }
                             }
-                                
+
                         }
                     }
                     if (site.Stations != null)
                     {
                         foreach (var item in site?.Stations)
                         {
-                            if (!string.IsNullOrEmpty(_workerOptions.ResponseOnDelete))
+                            if (!string.IsNullOrEmpty(workerOptions.ResponseOnDelete))
                             {
-                                HttpResponseMessage rm2 = await cl.GetAsync(_workerOptions.ResponseOnDelete + $"&id={item.Id}");
+                                HttpResponseMessage rm2 = await cl.GetAsync(workerOptions.ResponseOnDelete + $"&id={item.Id}");
                                 if (await rm2.Content.ReadAsStringAsync() != "ok")
                                 {
 
                                 }
                             }
-                                                                
+
                         }
                     }
 
@@ -283,7 +349,7 @@ namespace CTU60G
                 {
                     using (LogContext.PushProperty("ci", "missing critical information"))
                     {
-                        _logger.LogWarning($"{site.Infos.Ssid} will not be possible to publish, because of" + "{ci}:\n" +
+                        logger.LogWarning($"{site.Infos.Ssid} will not be possible to publish, because of" + "{ci}:\n" +
                         $"{e.Message}\n" +
                         $"original source:\n" +
                         JsonConvert.SerializeObject(site, Formatting.Indented));
@@ -294,7 +360,7 @@ namespace CTU60G
                 {
                     using (LogContext.PushProperty("ci", "invalid critical information"))
                     {
-                        _logger.LogWarning($"{site.Infos.Ssid} will not be possible to publish, because of" + "{ci} :\n" +
+                        logger.LogWarning($"{site.Infos.Ssid} will not be possible to publish, because of" + "{ci} :\n" +
                         $"Expected value: {e.ExpectedVauleInfo}\n" +
                         $"Current value: {e.CurrentValue}\n" +
                         $"original source:\n" +
@@ -313,20 +379,20 @@ namespace CTU60G
             {
                 try
                 {
-                    if(site.Stations.Count > 0)
-                    foreach (var item in site.Stations)
-                    {
-                        List<CtuWirelessUnit> stations = default;
-                        stations = client.GetStationByIdAsync(item.CtuReported).Result;
-                    }
+                    if (site.Stations.Count > 0)
+                        foreach (var item in site.Stations)
+                        {
+                            List<CtuWirelessUnit> stations = default;
+                            stations = client.GetStationByIdAsync(item.CtuReported).Result;
+                        }
                     else
                     {
                         List<CtuWirelessUnit> stations = default;
-                        stations =  client.GetStationByIdAsync(site.Ap.FirstOrDefault()?.CtuReported).Result;
+                        stations = client.GetStationByIdAsync(site.Ap.FirstOrDefault()?.CtuReported).Result;
                         if (stations.Count > 0)
                             client.DeleteConnectionAsync(site.Ap.FirstOrDefault()?.CtuReported);
                     }
-                    
+
                 }
                 catch (Exception e)
                 {
@@ -334,33 +400,28 @@ namespace CTU60G
                     throw e;
                 }
             }
+            TaskCompletionSource.SetResult(true);
+            appLifetime.StopApplication();
+            return;
         }
+
 
         private struct OnSiteData
         {
-            private DateTime lasTimeRefreshed;
-            private List<CtuWirelessUnit> dataOnSite;
-
             public OnSiteData(List<CtuWirelessUnit> dataOnSite)
             {
-                this.lasTimeRefreshed = DateTime.Now;
-                this.dataOnSite = dataOnSite;
+                this.LasTimeRefreshed = DateTime.Now;
+                this.DataOnSite = dataOnSite;
             }
 
             public void Refresh(List<CtuWirelessUnit> dataOnSite)
             {
-                this.dataOnSite = dataOnSite;
-                this.lasTimeRefreshed = DateTime.Now;
+                this.DataOnSite = dataOnSite;
+                this.LasTimeRefreshed = DateTime.Now;
             }
-            public DateTime LasTimeRefreshed
-            {
-                get { return lasTimeRefreshed; }
-            }
-            
-            public List<CtuWirelessUnit> DataOnSite
-            {
-                get { return dataOnSite; }
-            }
+            public DateTime LasTimeRefreshed { get; private set; }
+
+            public List<CtuWirelessUnit> DataOnSite { get; private set; }
         }
 
         private void NotifyViaMail(RegistrationJournal regJournal)
@@ -382,16 +443,12 @@ namespace CTU60G
             
         }
 
-        public override async Task StopAsync(CancellationToken stoppingToken)
-        {
-            stoppingToken.ThrowIfCancellationRequested();
-            await Task.CompletedTask;
-        }
+        
 
-        private SourceDataType GetSourceDataType()
+        private SourceDataType GetSourceDataType(string possibleSourceDataType)
         {
             Uri uriResult;
-            Uri.TryCreate(_workerOptions.DataURLOrFilePath, UriKind.Absolute, out uriResult);
+            Uri.TryCreate(possibleSourceDataType, UriKind.Absolute, out uriResult);
             if (uriResult == null) return SourceDataType.ERR;
             else if (uriResult.Scheme == Uri.UriSchemeHttp || uriResult.Scheme == Uri.UriSchemeHttps) return SourceDataType.URL;
             if (uriResult.IsFile && File.Exists(uriResult.AbsolutePath)) return SourceDataType.FILE;
@@ -399,36 +456,43 @@ namespace CTU60G
             return SourceDataType.ERR;
 
         }
-        private async Task CheckWorkerOptionValues(CancellationToken stoppingToken, SourceDataType sourceDataType)
+        private async Task<bool> CheckWorkerOptionValues(CancellationToken stoppingToken, SourceDataType sourceDataType)
         {
-            if (_workerOptions.CTULogin == string.Empty || _workerOptions.CTUPass == string.Empty)
+            if (workerOptions.CTULogin == string.Empty || workerOptions.CTUPass == string.Empty)
             {
-                _logger.LogError("Missing credentials for www.60ghz.ctu.cz");
-                await StopAsync(stoppingToken);
-                return;
+                logger.LogError("Missing credentials for www.60ghz.ctu.cz");
+                appLifetime.StopApplication();
+                return false;
             }
-            else if (_workerOptions.DataURLOrFilePath == string.Empty)
+            if ((sourceDataType = GetSourceDataType(workerOptions.DataURLOrFilePath)) == SourceDataType.ERR)
             {
-                _logger.LogError("Missing data source for www.60ghz,ctu.cz");
-                await StopAsync(stoppingToken);
-                return;
+                logger.LogError("Not valid file path or web url");
+                appLifetime.StopApplication();
+                return false;
             }
-            else if ((sourceDataType = GetSourceDataType()) == SourceDataType.ERR)
+            if(String.IsNullOrEmpty(workerOptions.Synchronization))
             {
-                _logger.LogError("Not valid file path or web url");
-                await StopAsync(stoppingToken);
-                return;
+                logger.LogError("Synchronization type not specified");
+                appLifetime.StopApplication();
+                return false;
             }
+            if(String.IsNullOrEmpty(workerOptions.Run))
+            {
+                logger.LogError("Run type not specified");
+                appLifetime.StopApplication();
+                return false;
+            }
+            return true;
         }
 
         private EmailService CheckEmailOptionValues()
         {
-            if (_emailOptions.Host != string.Empty &&
-                        _emailOptions.User != string.Empty &&
-                        _emailOptions.ToEmails.Count != 0 &&
-                        _emailOptions.FromEmail != string.Empty &&
-                        _emailOptions.Password != string.Empty)
-                return new EmailService(_emailOptions, System.Net.Mail.MailPriority.High, true);
+            if (emailOptions.Host != string.Empty &&
+                        emailOptions.User != string.Empty &&
+                        emailOptions.ToEmails.Count != 0 &&
+                        emailOptions.FromEmail != string.Empty &&
+                        emailOptions.Password != string.Empty)
+                return new EmailService(emailOptions, System.Net.Mail.MailPriority.High, true);
             return null;
         }
 
@@ -437,8 +501,8 @@ namespace CTU60G
 
             //todo check if readable + secure reading
             string data = (sourceDataType == SourceDataType.FILE) ?
-                    File.ReadAllText(_workerOptions.DataURLOrFilePath) :
-                    new WebClient().DownloadString(_workerOptions.DataURLOrFilePath);
+                    File.ReadAllText(workerOptions.DataURLOrFilePath) :
+                    new WebClient().DownloadString(workerOptions.DataURLOrFilePath);
 
             return data;
         }
@@ -460,7 +524,7 @@ namespace CTU60G
                     }
                     catch (Exception) // if general structure was ok but in propertyes is for instance forbiden character this exception will ocure and only part of whole data will be skipped.
                     {
-                        _logger.LogWarning($"Cannot deserialize part, skiping:\n{site.ToString()}");
+                        logger.LogWarning($"Cannot deserialize part, skiping:\n{site.ToString()}");
                     }
 
                 }
@@ -468,8 +532,8 @@ namespace CTU60G
             }
             catch (Exception e) // error in general structure, data are not usable
             {
-                _logger.LogError("Source data are not seriazible");
-                await StopAsync(stoppingToken);
+                logger.LogError("Source data are not seriazible");
+                appLifetime.StopApplication();
                 return null;
             }
 

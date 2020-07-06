@@ -7,7 +7,7 @@ using System.Text;
 
 namespace CTU60G
 {
-    public class BehaviourConfiguration : IBehaviourConfiguration
+    public class BehaviourConfiguration
     {
         public P2pParameters p2p { get; set;}
         public WigigP2pOptions wp2p { get; set; }

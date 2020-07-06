@@ -12,17 +12,17 @@ namespace CTU60G
     {
         public static BehaviourConfiguration Behaviour;
 
-        public static List<FixedP2PPair> CreatePTP(WirelessSite site)
+        public static List<P2PSite> CreatePTP(WirelessSite site)
         {
             WirelessUnit ap = site.Ap.FirstOrDefault();
-            List<FixedP2PPair> pairs = new List<FixedP2PPair>();
+            List<P2PSite> pairs = new List<P2PSite>();
             if(site.Stations != null)
             {
                 foreach (var stat in site.Stations)
                 {
                     FixedStationInfo a = ApplyBehaviour(ap);
                     FixedStationInfo b = ApplyBehaviour(stat);
-                    pairs.Add(new FixedP2PPair(a, b));
+                    pairs.Add(new P2PSite(a, b));
                 }
             }
             

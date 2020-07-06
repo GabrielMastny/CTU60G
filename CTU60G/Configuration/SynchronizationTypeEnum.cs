@@ -4,7 +4,9 @@ using System.Text;
 
 namespace CTU60G.Configuration
 {
-    public interface IWorkerConfiguration
+    public enum SynchronizationTypeEnum
     {
+        Full,
+        Manual
     }
 }
